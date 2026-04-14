@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import {
   StyleSheet,
   Text,
@@ -9,7 +9,9 @@ import {
   RefreshControl,
 } from "react-native";
 import { createClient } from "@supabase/supabase-js";
-import { useVideoPlayer, VideoView } from "expo-video"; // 💡 최신 패키지로 변경됨!
+import { useVideoPlayer, VideoView } from "expo-video";
+// 💡 WebRTC를 위한 패키지 추가
+import { RTCPeerConnection, RTCView, mediaDevices } from "react-native-webrtc";
 
 // 수파베이스 설정
 const SUPABASE_URL = "https://glmxqvkgdxbjxbsgppcr.supabase.co";
@@ -17,7 +19,9 @@ const SUPABASE_ANON_KEY =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdsbXhxdmtnZHhianhic2dwcGNyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYxMDIwMDQsImV4cCI6MjA5MTY3ODAwNH0.t7heJwCoybiGE1G3ocYkpbCSqAjaRe400wm-n3ccJ8k";
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-// 💡 비디오 플레이어 컴포넌트 분리 (최신 expo-video 방식)
+const STORE_PIN = "1234"; // POS기와 통신할 핀번호
+
+// 녹화된 비디오 재생용 컴포넌트
 const ModernVideoPlayer = ({
   url,
   onClose,
@@ -26,8 +30,8 @@ const ModernVideoPlayer = ({
   onClose: () => void;
 }) => {
   const player = useVideoPlayer(url, (player) => {
-    player.muted = true; // 웹 브라우저 자동 재생 차단 방지를 위해 음소거 설정
-    player.play(); // 자동 재생
+    player.muted = true;
+    player.play();
   });
 
   return (
@@ -50,6 +54,12 @@ export default function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [selectedVideo, setSelectedVideo] = useState<string | null>(null);
 
+  // 💡 WebRTC 스트리밍 상태 관리 변수들
+  const [isLive, setIsLive] = useState(false);
+  const [remoteStream, setRemoteStream] = useState<any>(null);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+
   const fetchLogs = async () => {
     setRefreshing(true);
     const { data, error } = await supabase
@@ -64,6 +74,11 @@ export default function App() {
 
   useEffect(() => {
     fetchLogs();
+
+    // 앱 종료 시 WebRTC 자원 정리
+    return () => {
+      stopLiveStream();
+    };
   }, []);
 
   const getVideoUrl = (fileName: string) => {
@@ -73,12 +88,88 @@ export default function App() {
     return data.publicUrl;
   };
 
+  // 💡 실시간 스트리밍 시작 로직
+  const startLiveStream = async () => {
+    setIsLive(true);
+    setSelectedVideo(null); // 녹화된 영상 보던 건 끄기
+
+    // 1. WebRTC 연결 객체 생성 (구글 스턴 서버 이용)
+    const configuration = {
+      iceServers: [{ url: "stun:stun.l.google.com:19302" }],
+    };
+    const pc = new RTCPeerConnection(configuration);
+    pcRef.current = pc;
+
+    // 2. POS기에서 영상이 넘어오면 화면에 띄우기 설정
+    pc.ontrack = (event) => {
+      console.log("🎥 POS 영상 수신 성공!");
+      setRemoteStream(event.streams[0]);
+    };
+
+    // 3. 수파베이스를 통해 POS기에 통화(연결) 요청 보내기
+    const channel = supabase.channel(`store-${STORE_PIN}`);
+    channelRef.current = channel;
+
+    channel
+      .on("broadcast", { event: "pos-answer" }, (payload) => {
+        console.log("🎥 POS 응답 수신완료");
+        pc.setRemoteDescription(payload.payload.signal);
+      })
+      .subscribe(async (status) => {
+        if (status === "SUBSCRIBED") {
+          console.log("📡 시그널링 채널 연결 완료, POS 호출 중...");
+          const offer = await pc.createOffer({});
+          await pc.setLocalDescription(offer);
+
+          channel.send({
+            type: "broadcast",
+            event: "app-offer",
+            payload: { signal: offer },
+          });
+        }
+      });
+  };
+
+  // 💡 실시간 스트리밍 종료 로직
+  const stopLiveStream = () => {
+    setIsLive(false);
+    setRemoteStream(null);
+    if (pcRef.current) pcRef.current.close();
+    if (channelRef.current) channelRef.current.unsubscribe();
+  };
+
   return (
     <SafeAreaView style={styles.container}>
-      <Text style={styles.headerTitle}>🚨 실시간 도난 알림</Text>
+      {/* 💡 헤더 및 실시간 매장보기 버튼 */}
+      <View style={styles.headerRow}>
+        <Text style={styles.headerTitle}>🚨 실시간 도난 알림</Text>
+        <TouchableOpacity
+          style={[
+            styles.liveBtn,
+            { backgroundColor: isLive ? "#ef4444" : "#10b981" },
+          ]}
+          onPress={isLive ? stopLiveStream : startLiveStream}
+        >
+          <Text style={styles.liveBtnText}>
+            {isLive ? "실시간 종료 ✖" : "🔴 실시간 매장보기"}
+          </Text>
+        </TouchableOpacity>
+      </View>
 
-      {/* 비디오 플레이어 영역 */}
-      {selectedVideo ? (
+      {/* 영상 출력 영역 (실시간 모드 vs 녹화영상 모드 vs 대기 모드) */}
+      {isLive && remoteStream ? (
+        <View style={styles.videoContainer}>
+          <RTCView
+            streamURL={remoteStream.toURL()}
+            style={styles.video}
+            objectFit="cover"
+          />
+        </View>
+      ) : isLive && !remoteStream ? (
+        <View style={styles.videoPlaceholder}>
+          <Text style={{ color: "#fff" }}>POS기 연결 중...</Text>
+        </View>
+      ) : selectedVideo ? (
         <ModernVideoPlayer
           url={selectedVideo}
           onClose={() => setSelectedVideo(null)}
@@ -105,7 +196,10 @@ export default function App() {
           return (
             <TouchableOpacity
               style={styles.logCard}
-              onPress={() => setSelectedVideo(getVideoUrl(item.video_url))}
+              onPress={() => {
+                if (isLive) stopLiveStream(); // 실시간 시청 중이면 끄고 재생
+                setSelectedVideo(getVideoUrl(item.video_url));
+              }}
             >
               <Text style={styles.logIcon}>{isTheft ? "🚨" : "ℹ️"}</Text>
               <View style={styles.logInfo}>
@@ -125,12 +219,27 @@ export default function App() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#f4f4f5" },
+  headerRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    backgroundColor: "#fff",
+    paddingTop: 40,
+    paddingRight: 15,
+  },
   headerTitle: {
     fontSize: 24,
     fontWeight: "bold",
     padding: 20,
-    paddingTop: 40,
-    backgroundColor: "#fff",
+  },
+  liveBtn: {
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+  },
+  liveBtnText: {
+    color: "#fff",
+    fontWeight: "bold",
   },
   videoContainer: {
     width: "100%",
@@ -143,7 +252,7 @@ const styles = StyleSheet.create({
   videoPlaceholder: {
     width: "100%",
     height: 250,
-    backgroundColor: "#e4e4e7",
+    backgroundColor: "#27272a",
     justifyContent: "center",
     alignItems: "center",
     marginBottom: 10,
